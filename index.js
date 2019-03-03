@@ -1,12 +1,12 @@
 "use strict";
 
 const Botkit = require("botkit");
-const webshot = require("webshot");
-const tempfile = require("tempfile");
-const fs = require("fs");
+const puppeteer = require("puppeteer");
 const request = require("request");
 const url = require("url");
 const querystring = require("querystring");
+const { WebClient } = require('@slack/client');
+const he = require('he');
 
 // This configuration can gets overwritten when process.env.SLACK_MESSAGE_EVENTS is given.
 const DEFAULT_SLACK_MESSAGE_EVENTS = "direct_message,direct_mention,mention";
@@ -48,48 +48,24 @@ const queryToSearch = (query) => {
   return `?${str}`;
 };
 
-const screenshot = (embedUrl) => new Promise((res, rej) => {
-  const outputFile = tempfile(".png");
-  const webshotOptions = {
-    screenSize: {
-      width: 720,
-      height: 360
-    },
-    shotSize: {
-      width: 720,
-      height: "all"
-    },
-    renderDelay: 2000,
-    timeout: 100000
-  };
-
-  webshot(embedUrl, outputFile, webshotOptions, (err) => {
-    if (err) rej(err);
-
-    res(outputFile);
-  })
-});
-
-const postImage = (bot, message, formData) => {
-  // bot.api.file.upload cannot upload binary file correctly, so directly call Slack API.
-  request.post({ url: "https://api.slack.com/api/files.upload", formData }, (err, resp, body) => {
-    if (err) {
-      const msg = `Something wrong happend in file upload : ${err}`;
-      bot.reply(message, msg);
-      bot.botkit.log.error(msg);
-    } else if (resp.statusCode == 200) {
-      bot.botkit.log("ok");
-    } else {
-      const msg = `Something wrong happend in file upload : status code=${resp.statusCode}`;
-      bot.reply(message, msg);
-      bot.botkit.log.error(msg);
-    }
-  });
+const screenshot = async (embedUrl) => {
+  let browser;
+  try {
+    browser = await puppeteer.launch({ timeout: 10000 });
+    const page = await browser.newPage();
+    await page.goto(embedUrl, { timeout: 10000 });
+    await page.waitForSelector("div[ng-view]", { timeout: 10000 });
+    const elem = await page.$("div[ng-view]");
+    return await elem.screenshot();
+  } finally {
+    if (browser) await browser.close();
+  }
 }
 
 const redashApiKeysPerHost = parseApiKeysPerHost();
 const slackBotToken = process.env.SLACK_BOT_TOKEN;
 const slackMessageEvents = process.env.SLACK_MESSAGE_EVENTS || DEFAULT_SLACK_MESSAGE_EVENTS;
+const slack = new WebClient(slackBotToken);
 
 const controller = Botkit.slackbot({
   debug: !!process.env.DEBUG
@@ -105,7 +81,7 @@ Object.keys(redashApiKeysPerHost).forEach((redashHost) => {
   controller.hears(`${redashHost}/queries/([0-9]+)[^>]*`, slackMessageEvents, async (bot, message) => {
     const originalUrl = message.match[0];
     const queryId = message.match[1];
-    const parsedUrl = url.parse(originalUrl, true);
+    const parsedUrl = url.parse(he.decode(originalUrl), true);
 
     if(parsedUrl.hash === null) {
       bot.reply(message, "Please specify visualization id by hash");
@@ -122,23 +98,31 @@ Object.keys(redashApiKeysPerHost).forEach((redashHost) => {
     bot.botkit.log(queryUrl);
     bot.botkit.log(embedUrl);
 
+    let buff;
     try {
-      const outputFile = await screenshot(embedUrl);
+      buff = await screenshot(embedUrl);
 
-      bot.botkit.log.debug(outputFile);
       bot.botkit.log.debug(Object.keys(message));
       bot.botkit.log(message.user + ":" + message.type + ":" + message.channel + ":" + message.text);
-
-      postImage(bot, message, {
-        token: slackBotToken,
-        filename: `query-${queryId}-visualization-${visualizationId}.png`,
-        file: fs.createReadStream(outputFile),
-        channels: message.channel
-      });
     } catch(err) {
       const msg = `Something wrong happend in take a screen capture : ${err}`;
       bot.reply(message, msg);
       return bot.botkit.log.error(msg);
+    }
+
+    if(buff === null) return ;
+
+    try {
+      await slack.files.upload({
+        channels: message.channel,
+        filename: `query-${queryId}-visualization-${visualizationId}.png`,
+        file: buff,
+      });
+      bot.botkit.log("ok");
+    } catch(e) {
+      const msg = `Something wrong happend in file upload : ${err}`;
+      bot.reply(message, msg);
+      bot.botkit.log.error(msg);
     }
   });
 });
